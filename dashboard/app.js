@@ -326,7 +326,7 @@
       '</div>' +
       '<h3>How the value is derived</h3>' +
       '<table class="breakdown"><tbody>' +
-      '<tr><td>TVL × category multiple (' + mult4(v.multiple) + '×, from ' + v.compsCount + ' traded peers)</td><td>' + usd(row.tvl_usd * v.multiple) + '</td></tr>' +
+      '<tr><td>TVL × category multiple (' + mult4(v.multiple) + '×, from ' + v.compsCount + ' traded peer' + (v.compsCount === 1 ? '' : 's') + ')</td><td>' + usd(row.tvl_usd * v.multiple) + '</td></tr>' +
       '<tr><td>× growth multiplier (' + pct(v.growthPct) + ' over 7 days)</td><td>' + mult4(v.growthMult) + '×</td></tr>' +
       '<tr><td>× maturity multiplier (' + esc(age) + ' with no token)</td><td>' + mult4(v.maturityMult) + '×</td></tr>' +
       '<tr><td>× chain-reach multiplier (' + row.chains.length + ' chain' + (row.chains.length === 1 ? '' : 's') + ')</td><td>' + mult4(v.chainMult) + '×</td></tr>' +
