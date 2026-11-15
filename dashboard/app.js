@@ -8,12 +8,13 @@
  * protocol's category, chains, TVL and age, never from a list of names.
  *
  * Implied value, in words:
- *   TVL x category multiple x growth multiplier x maturity multiplier x chain multiplier
- * The category multiple is the median market-cap/TVL ratio of the traded
- * protocols in that category, shrunk toward the global median when the
- * category has few traded peers. See the Model view for the full table.
+ *   fitted market cap x growth multiplier x maturity multiplier x chain multiplier
+ * The fitted market cap comes from a least-squares line in logs,
+ * ln(mcap) = intercept + slope x ln(TVL), fitted on the traded protocols,
+ * plus one shrunk offset per category. See the Model view for the line,
+ * the offsets and the table behind them.
  *
- * The model is tested blind in validateOutOfSample(), twice: multiples
+ * The model is tested blind in validateOutOfSample(), twice: the line
  * fitted on half the traded protocols, the other half predicted unseen,
  * then the halves swap, so every traded protocol is predicted exactly
  * once by a fit that never saw it. Every farm plan ends in a netted
@@ -39,16 +40,15 @@
     return Math.max(0, Math.floor((a - b) / DAY_MS));
   }
 
-  function multipleFor(row, comps) {
-    var key = row.category === null || row.category === undefined ? '(uncategorised)' : row.category;
-    if (comps.by_category[key] !== undefined) return { multiple: comps.by_category[key], count: comps.counts[key] || 0 };
-    return { multiple: comps.global, count: comps.global_count };
-  }
-
   /* The implied value one protocol gets. Every factor is shown in its detail view. */
-  function impliedValue(row, asOf, comps, model) {
+  function impliedValue(row, asOf, fit, model) {
     var age = ageDays(asOf, row.listed_at);
-    var m = multipleFor(row, comps);
+    var key = row.category === null || row.category === undefined ? '(uncategorised)' : row.category;
+    var offset = fit.offsets[key] === undefined ? 0 : fit.offsets[key];
+    var count = fit.counts[key] || 0;
+    var tvl = Math.max(row.tvl_usd, 1);
+    var fitted = Math.exp(fit.intercept + fit.slope * Math.log(tvl) + offset);
+    var multiple = fitted / tvl;
     var rawGrowth = finite(row.change_7d, 0);
     var growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
     var growthMult = 1 + (growthPct / 100) * model.growth_weight;
@@ -57,8 +57,8 @@
       (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
     var extraChains = Math.min(Math.max(row.chains.length - 1, 0), model.chain_max_steps);
     var chainMult = 1 + extraChains * model.chain_step;
-    var implied = Math.max(1, Math.round(row.tvl_usd * m.multiple * growthMult * maturityMult * chainMult));
-    return { implied: implied, multiple: m.multiple, compsCount: m.count, growthPct: growthPct,
+    var implied = Math.max(1, Math.round(fitted * growthMult * maturityMult * chainMult));
+    return { implied: implied, fitted: fitted, multiple: multiple, offset: offset, compsCount: count, growthPct: growthPct,
       growthMult: growthMult, maturityMult: maturityMult, chainMult: chainMult, age: age };
   }
 
@@ -77,85 +77,93 @@
     return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
   }
 
-  /* The comps table fitted on one list of traded protocols: the median
-     ratio per category, shrunk toward the global median. Mirrors
-     calibrateComps() in lib/model.ts; the holdout fits it on half the
-     traded protocols only. The list arrives pre-filtered: wrapped, staked
-     and bridged products never calibrate a multiple. */
-  function calibrateCompsFrom(list, model) {
-    var byCategory = {};
-    var all = [];
-    var i, p, ratio, key;
+  /* The line fitted on one list of traded protocols: least squares of
+     ln(mcap) on ln(TVL), then one offset per category, the median of its
+     residuals shrunk toward zero. Mirrors fitRegression() in
+     lib/model.ts; the holdout fits it on half the traded protocols only.
+     The list arrives pre-filtered: wrapped, staked and bridged products
+     never calibrate the fit. */
+  function fitRegression(list, model) {
+    var usable = [], i, p;
     for (i = 0; i < list.length; i++) {
       p = list[i];
-      if (!(p.mcap_usd > 0) || !(p.tvl_usd > 0)) continue;
-      ratio = Math.min(3, Math.max(model.multiple_floor, p.mcap_usd / p.tvl_usd));
-      if (!isFinite(ratio) || ratio <= 0) continue;
-      all.push(ratio);
+      if (p.mcap_usd > 0 && p.tvl_usd > 0) usable.push(p);
+    }
+    var n = usable.length;
+    if (n === 0) return { intercept: Math.log(0.25), slope: 1, offsets: {}, counts: {}, fit_count: 0 };
+    var sumX = 0, sumY = 0;
+    for (i = 0; i < n; i++) { sumX += Math.log(usable[i].tvl_usd); sumY += Math.log(usable[i].mcap_usd); }
+    var meanX = sumX / n, meanY = sumY / n;
+    var sxy = 0, sxx = 0, dx;
+    for (i = 0; i < n; i++) {
+      dx = Math.log(usable[i].tvl_usd) - meanX;
+      sxy += dx * (Math.log(usable[i].mcap_usd) - meanY);
+      sxx += dx * dx;
+    }
+    var slope = sxx === 0 ? 0 : sxy / sxx;
+    var intercept = meanY - slope * meanX;
+    var byCategory = {}, key;
+    for (i = 0; i < n; i++) {
+      p = usable[i];
+      var residual = Math.log(p.mcap_usd) - (intercept + slope * Math.log(p.tvl_usd));
       key = p.category === null || p.category === undefined ? '(uncategorised)' : p.category;
       if (!byCategory[key]) byCategory[key] = [];
-      byCategory[key].push(ratio);
+      byCategory[key].push(residual);
     }
-    all.sort(function (a, b) { return a - b; });
-    var globalRaw = median(all);
-    var global = isFinite(globalRaw) ? Math.min(model.multiple_cap, Math.max(model.multiple_floor, globalRaw)) : 0.25;
-    var table = { by_category: {}, counts: {}, global: global, global_count: all.length };
+    var offsets = {}, counts = {};
     var keys = Object.keys(byCategory).sort();
     for (i = 0; i < keys.length; i++) {
       key = keys[i];
-      var ratios = byCategory[key].sort(function (a, b) { return a - b; });
-      var raw = median(ratios);
-      var shrunk = (ratios.length * raw + model.shrink_prior * global) / (ratios.length + model.shrink_prior);
-      table.by_category[key] = Math.min(model.multiple_cap, Math.max(model.multiple_floor, shrunk));
-      table.counts[key] = ratios.length;
+      var residuals = byCategory[key].sort(function (a, b) { return a - b; });
+      offsets[key] = (residuals.length * median(residuals)) / (residuals.length + model.shrink_prior);
+      counts[key] = residuals.length;
     }
-    return table;
+    return { intercept: intercept, slope: slope, offsets: offsets, counts: counts, fit_count: n };
   }
 
-  /* The comps band: per category, the 25th and 75th percentiles of the
-     traded ratios, shrunk toward the global percentiles. Mirrors
-     calibrateBands() in lib/model.ts. */
-  function bandTable(list, model) {
+  /* The residual band: per category, the 25th and 75th percentiles of the
+     traded residuals from the fitted line, in log points, shrunk toward
+     the global percentiles. Mirrors calibrateBands() in lib/model.ts. */
+  function bandTable(list, fit, model) {
     var byCategory = {};
     var all = [];
-    var i, p, ratio, key;
+    var i, p, residual, key;
     for (i = 0; i < list.length; i++) {
       p = list[i];
       if (!(p.mcap_usd > 0) || !(p.tvl_usd > 0)) continue;
-      ratio = Math.min(3, Math.max(model.multiple_floor, p.mcap_usd / p.tvl_usd));
-      if (!isFinite(ratio) || ratio <= 0) continue;
-      all.push(ratio);
       key = p.category === null || p.category === undefined ? '(uncategorised)' : p.category;
+      residual = Math.log(p.mcap_usd) - (fit.intercept + fit.slope * Math.log(Math.max(p.tvl_usd, 1)) + (fit.offsets[key] === undefined ? 0 : fit.offsets[key]));
+      if (!isFinite(residual)) continue;
+      all.push(residual);
       if (!byCategory[key]) byCategory[key] = [];
-      byCategory[key].push(ratio);
+      byCategory[key].push(residual);
     }
     all.sort(function (a, b) { return a - b; });
     var g25 = quantile(all, 0.25);
     var g75 = quantile(all, 0.75);
-    function clamp(n) { return Math.min(model.multiple_cap, Math.max(model.multiple_floor, n)); }
-    var table = { by_category: {}, global: { low: isFinite(g25) ? clamp(g25) : model.multiple_floor, high: isFinite(g75) ? clamp(g75) : 0.25 }, global_count: all.length };
+    var table = { by_category: {}, global: { low: isFinite(g25) ? Math.min(g25, 0) : 0, high: isFinite(g75) ? g75 : 0 }, global_count: all.length };
     var keys = Object.keys(byCategory).sort();
     for (i = 0; i < keys.length; i++) {
       key = keys[i];
-      var ratios = byCategory[key].sort(function (a, b) { return a - b; });
-      var low = (ratios.length * quantile(ratios, 0.25) + model.shrink_prior * g25) / (ratios.length + model.shrink_prior);
-      var high = (ratios.length * quantile(ratios, 0.75) + model.shrink_prior * g75) / (ratios.length + model.shrink_prior);
-      table.by_category[key] = { low: clamp(low), high: clamp(high), n: ratios.length };
+      var residuals = byCategory[key].sort(function (a, b) { return a - b; });
+      var low = (residuals.length * quantile(residuals, 0.25) + model.shrink_prior * g25) / (residuals.length + model.shrink_prior);
+      var high = (residuals.length * quantile(residuals, 0.75) + model.shrink_prior * g75) / (residuals.length + model.shrink_prior);
+      table.by_category[key] = { low: Math.min(low, 0), high: high, n: residuals.length };
     }
     return table;
   }
 
   /* The blind holdout, run both ways: traded protocols sorted by slug,
-     split into alternating halves; multiples fitted on one half only,
+     split into alternating halves; the line fitted on one half only,
      the other half's market caps predicted with impliedValue() — then
      the halves swap, so every traded protocol is predicted exactly once.
      Mirrors validateOutOfSample() in lib/model.ts. */
   function validateOutOfSample(comps, asOf, model) {
     var sorted = comps.slice().sort(function (a, b) { return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0; });
     function runSplit(fit, test) {
-      var fitComps = calibrateCompsFrom(fit, model);
+      var fitLine = fitRegression(fit, model);
       var predictions = test.map(function (p) {
-        var predicted = impliedValue(p, asOf, fitComps, model).implied;
+        var predicted = impliedValue(p, asOf, fitLine, model).implied;
         return { slug: p.slug, name: p.name, actual: p.mcap_usd, predicted: predicted, abs_error: Math.abs(predicted - p.mcap_usd) / p.mcap_usd };
       });
       predictions.sort(function (a, b) { return a.abs_error - b.abs_error || (a.slug < b.slug ? -1 : 1); });
@@ -217,10 +225,10 @@
   /* The netted verdict. Mirrors verdictFor() in lib/model.ts: the protocol
      at the low end of its comps band, a stated share of a stated community
      allocation, against the plan's own gas and fees. */
-  function verdictFor(row, mults, bands, model) {
+  function verdictFor(row, v, bands, model) {
     var key = row.category === null || row.category === undefined ? '(uncategorised)' : row.category;
     var band = bands.by_category[key] !== undefined ? bands.by_category[key] : bands.global;
-    var bandLow = Math.max(1, Math.round(row.tvl_usd * band.low * mults.growthMult * mults.maturityMult * mults.chainMult));
+    var bandLow = Math.max(1, Math.round(v.fitted * Math.exp(band.low) * v.growthMult * v.maturityMult * v.chainMult));
     var prizeLow = (bandLow * model.farm_share) / model.farmers;
     var costUsd = gasUsd(chainOf(row)) * model.plan_txs + model.flat_cost_usd;
     var ratio = prizeLow / costUsd;
@@ -340,7 +348,7 @@
   /* Expose the pure functions for the offline agreement check (node). */
   var api = { impliedValue: impliedValue, farmSteps: farmSteps, stepText: stepText, ageDays: ageDays,
     verdictFor: verdictFor, bandTable: bandTable, validateOutOfSample: validateOutOfSample,
-    calibrateCompsFrom: calibrateCompsFrom, gasUsd: gasUsd };
+    fitRegression: fitRegression, gasUsd: gasUsd };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 
   /* ---------- the page (browser only) ---------- */
@@ -356,11 +364,11 @@
   /* The page re-derives the bands, the holdout and every verdict from the
      raw records in data.js, with the same functions the model ran: what
      the screenshots show is what this source computes. */
-  var bands = bandTable(R.comp_protocols, R.model);
+  var bands = bandTable(R.comp_protocols, R.regression, R.model);
   var validation = validateOutOfSample(R.comp_protocols, R.as_of, R.model);
   var farmCount = 0, thinCount = 0, skipCount = 0;
   rows.forEach(function (r) {
-    var v = impliedValue(r, R.as_of, R.comps, R.model);
+    var v = impliedValue(r, R.as_of, R.regression, R.model);
     r.verdict = verdictFor(r, v, bands, R.model);
     r.verdict_rank = r.verdict.verdict === 'FARM' ? 0 : r.verdict.verdict === 'THIN' ? 1 : 2;
     if (r.verdict.verdict === 'FARM') farmCount++;
@@ -482,7 +490,7 @@
       '<th class="num sortable" data-sort="tvl_usd">TVL' + sortArrow('tvl_usd') + '</th>' +
       '<th class="num sortable" data-sort="change_7d">7d' + sortArrow('change_7d') + '</th>' +
       '<th class="num sortable" data-sort="implied_value_usd">Implied value' + sortArrow('implied_value_usd') + '</th>' +
-      '<th class="num sortable" data-sort="category_multiple">Multiple' + sortArrow('category_multiple') + '</th>' +
+      '<th class="num sortable" data-sort="fitted_multiple">Multiple' + sortArrow('fitted_multiple') + '</th>' +
       '<th class="sortable" data-sort="verdict_rank">Verdict' + sortArrow('verdict_rank') + '</th>' +
       '</tr></thead><tbody>';
     var body = list.map(function (r) {
@@ -493,7 +501,7 @@
         '<td class="num">' + usd(r.tvl_usd) + '</td>' +
         '<td class="num ' + pctClass(r.change_7d) + '">' + pct(r.change_7d) + '</td>' +
         '<td class="num"><b>' + usd(r.implied_value_usd) + '</b></td>' +
-        '<td class="num">' + mult4(r.category_multiple) + '×</td>' +
+        '<td class="num">' + mult4(r.fitted_multiple) + '×</td>' +
         '<td><span class="verdict ' + r.verdict.verdict.toLowerCase() + '">' + r.verdict.verdict + '</span></td>' +
         '</tr>';
     }).join('');
@@ -501,7 +509,7 @@
   }
 
   function detailHtml(row) {
-    var v = impliedValue(row, R.as_of, R.comps, R.model);
+    var v = impliedValue(row, R.as_of, R.regression, R.model);
     var steps = farmSteps(row, row.verdict, R.model).map(function (s) {
       return '<li>' + esc(s.text) + ' <span class="cost">Cost: ' + esc(s.cost) + '. Time: ' + esc(s.time) + '.</span></li>';
     }).join('');
@@ -516,13 +524,13 @@
       '<div class="cell"><span>Implied value</span><b>' + usd(row.implied_value_usd) + '</b></div>' +
       '<div class="cell"><span>TVL</span><b>' + usd(row.tvl_usd) + '</b></div>' +
       '<div class="cell"><span>7-day TVL change</span><b class="' + pctClass(row.change_7d) + '">' + pct(row.change_7d) + '</b></div>' +
-      '<div class="cell"><span>Category multiple</span><b>' + mult4(v.multiple) + '×</b></div>' +
+      '<div class="cell"><span>Fitted multiple</span><b>' + mult4(v.multiple) + '×</b></div>' +
       '<div class="cell"><span>Traded comps</span><b>' + v.compsCount + '</b></div>' +
       '<div class="cell"><span>Chains</span><b>' + row.chains.length + '</b></div>' +
       '</div>' +
       '<h3>How the value is derived</h3>' +
       '<table class="breakdown"><tbody>' +
-      '<tr><td>TVL × category multiple (' + mult4(v.multiple) + '×, from ' + v.compsCount + ' traded peer' + (v.compsCount === 1 ? '' : 's') + ')</td><td>' + usd(row.tvl_usd * v.multiple) + '</td></tr>' +
+      '<tr><td>Fitted market cap (regression line + ' + esc(row.category || 'uncategorised') + ' offset ' + mult4(Math.exp(v.offset)) + '×, from ' + v.compsCount + ' traded peer' + (v.compsCount === 1 ? '' : 's') + ')</td><td>' + usd(v.fitted) + '</td></tr>' +
       '<tr><td>× growth multiplier (' + pct(v.growthPct) + ' over 7 days)</td><td>' + mult4(v.growthMult) + '×</td></tr>' +
       '<tr><td>× maturity multiplier (' + esc(age) + ' with no token)</td><td>' + mult4(v.maturityMult) + '×</td></tr>' +
       '<tr><td>× chain-reach multiplier (' + row.chains.length + ' chain' + (row.chains.length === 1 ? '' : 's') + ')</td><td>' + mult4(v.chainMult) + '×</td></tr>' +
@@ -576,7 +584,7 @@
         '<td class="num">' + pctPlain(s.within_3x * 100) + '</td></tr>';
     }).join('');
     return '<article class="detail"><h2>Validation: tested blind</h2>' +
-      '<p class="meta">The multiples are fitted on one half of the traded protocols and tested on the other half, which calibration never sees — then the halves swap, so every traded protocol is predicted exactly once by a fit that never saw it. The split is every second protocol in slug order, so anyone can reproduce it.</p>' +
+      '<p class="meta">The regression is fitted on one half of the traded protocols and tested on the other half, which calibration never sees — then the halves swap, so every traded protocol is predicted exactly once by a fit that never saw it. The split is every second protocol in slug order, so anyone can reproduce it.</p>' +
       '<div class="grid">' +
       '<div class="cell"><span>Predicted blind</span><b>' + pooled.count + ' traded protocols</b></div>' +
       '<div class="cell"><span>Median miss</span><b>' + pctPlain(pooled.median_abs_error * 100) + '</b></div>' +
@@ -585,7 +593,7 @@
       '</div>' +
       '<h3>Both directions</h3>' +
       '<table><thead><tr><th>Split</th><th class="num">Fitted on</th><th class="num">Tested on</th><th class="num">Median miss</th><th class="num">Within 2×</th><th class="num">Within 3×</th></tr></thead><tbody>' + splitRows + '</tbody></table>' +
-      '<p class="sub">A comps multiple is a rough instrument: the median unseen protocol is missed by about ' + pctPlain(pooled.median_abs_error * 100) + '. The board ranks by the same fitted multiples, so read the ranks as bands, not prices. The holdout is validateOutOfSample() in this page\'s source.</p>' +
+      '<p class="sub">A fitted line is a rough instrument: the median unseen protocol is missed by about ' + pctPlain(pooled.median_abs_error * 100) + '. The board ranks by the same fitted line, so read the ranks as bands, not prices. The holdout is validateOutOfSample() in this page\'s source.</p>' +
       '<h3>Closest predictions</h3>' +
       '<table><thead><tr><th>Protocol</th><th class="num">Market cap</th><th class="num">Predicted</th><th class="num">Miss</th></tr></thead><tbody>' + predRows(best) + '</tbody></table>' +
       '<h3>Furthest predictions</h3>' +
@@ -594,21 +602,23 @@
 
   function modelHtml() {
     var m = R.model;
-    var comps = Object.keys(R.comps.by_category).map(function (k) {
-      return { cat: k, mult: R.comps.by_category[k], n: R.comps.counts[k] || 0 };
-    }).sort(function (a, b) { return b.n - a.n || a.cat.localeCompare(b.cat); });
-    var compRows = comps.map(function (c) {
-      return '<tr><td>' + esc(c.cat) + '</td><td class="num">' + mult4(c.mult) + '×</td><td class="num">' + c.n + '</td></tr>';
+    var reg = R.regression;
+    var offsets = Object.keys(reg.offsets).map(function (k) {
+      return { cat: k, off: reg.offsets[k], n: reg.counts[k] || 0 };
+    }).sort(function (a, b) { return b.off - a.off || a.cat.localeCompare(b.cat); });
+    var offsetRows = offsets.map(function (c) {
+      return '<tr><td>' + esc(c.cat) + '</td><td class="num">' + mult4(Math.exp(c.off)) + '×</td><td class="num">' + c.n + '</td></tr>';
     }).join('');
     return '<article class="detail"><h2>The model: ' + esc(R.model_version) + '</h2>' +
       '<p class="meta">One function scores every row. No protocol name is special-cased.</p>' +
-      '<div class="formula">implied = TVL × categoryMultiple × growthMult × maturityMult × chainMult</div>' +
-      '<h3>Category multiple</h3>' +
-      '<p>For each category, the median market-cap/TVL ratio of its protocols whose token already trades. ' +
-      'A category with few traded peers is shrunk toward the global median (' + mult4(R.comps.global) + '×, from ' + R.comps.global_count + ' traded protocols) ' +
-      'with a prior weight of ' + m.shrink_prior + ', so one outlier cannot set a price. Single ratios are winsorised at 3× before the median, ' +
-      'and every multiple is clamped to ' + m.multiple_floor + '×–' + m.multiple_cap + '×. Wrapped, staked and bridged products never calibrate ' +
-      'a multiple: their ratios are the tokens they wrap, not peer multiples, so the comps count ' + R.comps.global_count + ' traded protocols, ' +
+      '<div class="formula">implied = exp(intercept + slope × ln(TVL) + offset) × growthMult × maturityMult × chainMult</div>' +
+      '<h3>The fitted line</h3>' +
+      '<p>Market cap grows slower than TVL, so the model is a least-squares line in logs: ln(market cap) = ' + reg.intercept.toFixed(4) + ' + ' + reg.slope.toFixed(4) + ' × ln(TVL), fitted on ' + reg.fit_count + ' traded protocols. ' +
+      'A slope below 1 means a protocol ten times larger is worth about ' + Math.pow(10, reg.slope).toFixed(1) + '× as much, not 10×. ' +
+      'Each category then gets an offset: the median of its residuals from the line, shrunk toward zero with a prior weight of ' + m.shrink_prior + ', so a category with one or two traded peers cannot set an extreme price. Categories with no traded peers use the line alone. ' +
+      'The verdicts price each protocol at the low end of its residual band: the fitted value times the 25th percentile of its category\'s residuals from the line, shrunk toward the global 25th percentile, so the conservative case always sits below the fitted value. ' +
+      'Wrapped, staked and bridged products never calibrate ' +
+      'the fit: their ratios are the tokens they wrap, not peer values, so the fit counts ' + reg.fit_count + ' traded protocols, ' +
       'not every token that trades.</p>' +
       '<h3>Growth, maturity, reach</h3>' +
       '<p>Growth: the 7-day TVL change, clamped to ' + m.growth_floor + '%–' + m.growth_cap + '%, moves the value with weight ' + m.growth_weight + '. ' +
@@ -618,10 +628,10 @@
       '<p>Wrapped, staked and bridged products of tokens that already trade are kept out of the early set and out of the comps by the house\'s own watchlist rule: ' +
       'bridge, liquid staking and restaking categories, wrapped/staked names, version markers and exchange names. Every watchlist slug is always ranked.</p>' +
       '<h3>Tested blind</h3>' +
-      '<p>The multiples are fitted twice: once on each half of the traded protocols, each half tested by a fit that never saw it, so all ' + validation.pooled.count + ' traded protocols are predicted blind. Median miss ' + pctPlain(validation.pooled.median_abs_error * 100) + ', ' + pctPlain(validation.pooled.within_2x * 100) + ' within 2× of the market cap. See the Validation view for the method and every prediction.</p>' +
-      '<h3>Comps table</h3>' +
-      '<table><thead><tr><th>Category</th><th class="num">Multiple</th><th class="num">Traded peers</th></tr></thead><tbody>' +
-      compRows + '<tr><td><b>Global fallback</b></td><td class="num"><b>' + mult4(R.comps.global) + '×</b></td><td class="num"><b>' + R.comps.global_count + '</b></td></tr>' +
+      '<p>The regression is fitted twice: once on each half of the traded protocols, each half tested by a fit that never saw it, so all ' + validation.pooled.count + ' traded protocols are predicted blind. Median miss ' + pctPlain(validation.pooled.median_abs_error * 100) + ', ' + pctPlain(validation.pooled.within_2x * 100) + ' within 2× of the market cap. See the Validation view for the method and every prediction.</p>' +
+      '<h3>Category offsets</h3>' +
+      '<table><thead><tr><th>Category</th><th class="num">Offset, as a multiplier</th><th class="num">Traded peers</th></tr></thead><tbody>' +
+      offsetRows +
       '</tbody></table></article>';
   }
 

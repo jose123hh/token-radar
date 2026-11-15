@@ -1,7 +1,8 @@
 // Token radar entry (Node 22, standard library only).
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input), scores
-// every rankable pre-token protocol with the comps model in lib/model.ts,
+// every rankable pre-token protocol with the log-log regression in
+// lib/model.ts,
 // writes the ranked board to /output/board.json and the dashboard's dataset
 // to /output/data.js, copies dashboard/ and screenshots/ to /output, and
 // writes /output/dossier.json with the vendored make.fun library.

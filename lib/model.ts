@@ -1,39 +1,41 @@
 // Token radar model: a sealed snapshot in, a ranked board out.
 //
-// The board ranks pre-token protocols by an implied value that is calibrated
-// from the snapshot's OWN market data, not from a hand-kept list of names:
+// The board ranks pre-token protocols by an implied value fitted from the
+// snapshot's OWN market data, not from a hand-kept list of names:
 //
-//   1. Comps: for every category, the median market-cap/TVL ratio of the
-//      protocols in that category whose token already trades AND that are
-//      not themselves wrapped, staked or bridged products: a wrapped
-//      product's ratio is the token it wraps, not a peer multiple. A
-//      pre-token protocol is worth what its traded peers are worth per
-//      dollar of TVL. Categories with few traded peers are shrunk toward
-//      the global median, so one outlier cannot set a price; categories
-//      with none use it.
-//   2. Growth: the 7-day TVL change, clamped, moves the value up or down.
-//   3. Maturity: the longer a protocol has run with no token, the closer its
-//      implied value sits to the full comps value; young protocols are
-//      discounted for the risk that the record is new.
-//   4. Reach: a protocol live on more chains gets a small premium, capped.
+//   1. The line: market cap scales with TVL sub-linearly, so the model is
+//      a least-squares line in logs — ln(mcap) = intercept + slope x
+//      ln(TVL) — fitted on the protocols whose token already trades AND
+//      that are not themselves wrapped, staked or bridged products: a
+//      wrapped product's ratio is the token it wraps, not a peer.
+//   2. The offset: each category gets an offset, the median of its
+//      residuals from the line, shrunk toward zero by a prior of
+//      `shrink_prior` phantom protocols, so a category with one or two
+//      traded peers cannot set an extreme price; categories with none
+//      use the line alone.
+//   3. Growth: the 7-day TVL change, clamped, moves the value up or down.
+//   4. Maturity: the longer a protocol has run with no token, the closer
+//      its implied value sits to the full fitted value; young protocols
+//      are discounted for the risk that the record is new.
+//   5. Reach: a protocol live on more chains gets a small premium, capped.
 //
 // The model is tested blind before it is trusted, twice: the traded
-// protocols are split in two by slug order, the multiples are fitted on
-// one half only and the other half's market caps are predicted without
-// ever touching calibration — then the halves swap, so every traded
-// protocol is predicted exactly once by a fit that never saw it.
+// protocols are split in two by slug order, the line is fitted on one
+// half only and the other half's market caps are predicted without ever
+// touching calibration — then the halves swap, so every traded protocol
+// is predicted exactly once by a fit that never saw it.
 // validateOutOfSample() reports both splits and the pooled miss. Every farm plan
 // ends in a netted verdict: the low end of the comps band, a stated share
 // of a stated community allocation, against the plan's own gas and fees.
 // FARM, THIN or SKIP, with the arithmetic on the page.
 //
 // Wrapped, staked and bridged products of tokens that already trade are
-// never ranked as early finds and never calibrate a multiple: the house's
+// never ranked as early finds and never calibrate the fit: the house's
 // own watchlist rule (its excluded categories, wrapped/staked names,
 // version markers and exchange names) keeps them out of the early set and
-// out of the comps, while every watchlist slug is ranked.
+// out of the fit, while every watchlist slug is ranked.
 //
-//   implied = TVL x categoryMultiple x growthMult x maturityMult x chainMult
+//   implied = exp(intercept + slope x ln(TVL) + offset) x growthMult x maturityMult x chainMult
 //
 // Every row states the inputs it was scored from, so the dashboard can show
 // the derivation and a reader can re-derive any rank by hand. No protocol
@@ -106,7 +108,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label, shown in the dashboard. */
-export const MODEL_VERSION = 'radar-comps-3';
+export const MODEL_VERSION = 'radar-loglog-1';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -135,7 +137,8 @@ export interface BoardRow {
   age_days: number | null;
   implied_value_usd: number;
   model: {
-    category_multiple: number;
+    fitted_multiple: number;
+    fitted_value_usd: number;
     comps_count: number;
     growth_pct: number;
     growth_multiplier: number;
@@ -159,7 +162,8 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
-  category_multiple: number;
+  fitted_multiple: number;
+  fitted_value_usd: number;
   comps_count: number;
   growth_multiplier: number;
   maturity_multiplier: number;
@@ -177,12 +181,13 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** The comps calibration: one multiple per category, plus the global fallback. */
-export interface CompsTable {
-  by_category: Record<string, number>;
+/** The fitted line: ln(mcap) = intercept + slope x ln(TVL), plus one shrunk offset per category. */
+export interface RegressionFit {
+  intercept: number;
+  slope: number;
+  offsets: Record<string, number>;
   counts: Record<string, number>;
-  global: number;
-  global_count: number;
+  fit_count: number;
 }
 
 /** A traded protocol as the dashboard receives it: the raw record the comps and the holdout recompute from. */
@@ -197,14 +202,14 @@ export interface CompProtocol {
   listed_at: string | null;
 }
 
-/** One category's comps band: the 25th and 75th percentiles of its traded ratios. */
+/** One category's residual band: the 25th and 75th percentiles of its traded residuals, in log points. */
 export interface BandRow {
   low: number;
   high: number;
   n: number;
 }
 
-/** The comps band: one low/high pair per category, plus the global fallback. */
+/** The residual band: one low/high pair per category, plus the global fallback. */
 export interface BandTable {
   by_category: Record<string, BandRow>;
   global: { low: number; high: number };
@@ -261,7 +266,7 @@ export interface RadarData {
   floor_usd: number;
   model: ModelConstants;
   model_version: string;
-  comps: CompsTable;
+  regression: RegressionFit;
   comp_protocols: CompProtocol[];
   bands: BandTable;
   validation: ValidationResult;
@@ -311,50 +316,57 @@ export function compProtocols(snapshot: Snapshot): (SnapshotProtocol & { mcap_us
 }
 
 /**
- * Calibrate the comps table from the snapshot's traded protocols: for each
- * category, the median market-cap/TVL ratio of its protocols whose token
- * already trades, shrunk toward the global median by a prior of
- * `shrink_prior` phantom protocols at the global value, so a category with
- * one or two traded peers cannot set an extreme price. Multiples are
- * clamped so one outlier cannot set a price.
+ * Fit the line on one list of traded protocols: ordinary least squares of
+ * ln(mcap) on ln(TVL), then one offset per category — the median of that
+ * category's residuals from the line, shrunk toward zero by a prior of
+ * `shrink_prior` phantom protocols at zero, so a category with one or two
+ * traded peers cannot set an extreme offset. Categories are recorded in
+ * sorted order, so the fit serialises deterministically. The list arrives
+ * pre-filtered: wrapped, staked and bridged products never calibrate the
+ * fit. An empty list falls back to the line fitted value = 0.25 x TVL.
  */
-export function calibrateComps(snapshot: Snapshot, model: ModelConstants = MODEL): CompsTable {
+export function fitRegression(
+  list: (SnapshotProtocol & { mcap_usd: number })[],
+  model: ModelConstants = MODEL,
+): RegressionFit {
+  const usable = list.filter((p) => p.mcap_usd > 0 && p.tvl_usd > 0);
+  const n = usable.length;
+  if (n === 0) {
+    return { intercept: Math.log(0.25), slope: 1, offsets: {}, counts: {}, fit_count: 0 };
+  }
+  let sumX = 0;
+  let sumY = 0;
+  for (const p of usable) {
+    sumX += Math.log(p.tvl_usd);
+    sumY += Math.log(p.mcap_usd);
+  }
+  const meanX = sumX / n;
+  const meanY = sumY / n;
+  let sxy = 0;
+  let sxx = 0;
+  for (const p of usable) {
+    const dx = Math.log(p.tvl_usd) - meanX;
+    sxy += dx * (Math.log(p.mcap_usd) - meanY);
+    sxx += dx * dx;
+  }
+  const slope = sxx === 0 ? 0 : sxy / sxx;
+  const intercept = meanY - slope * meanX;
   const byCategory = new Map<string, number[]>();
-  const all: number[] = [];
-  // One comp's ratio is winsorised before it can move a median: a protocol
-  // with a tiny TVL and a large market cap must not set its category's price.
-  const RATIO_WINSOR = 3;
-  for (const p of compProtocols(snapshot)) {
-    const ratio = Math.min(RATIO_WINSOR, Math.max(model.multiple_floor, p.mcap_usd / p.tvl_usd));
-    if (!Number.isFinite(ratio) || ratio <= 0) continue;
-    all.push(ratio);
+  for (const p of usable) {
+    const residual = Math.log(p.mcap_usd) - (intercept + slope * Math.log(p.tvl_usd));
     const key = p.category ?? '(uncategorised)';
-    const list = byCategory.get(key) ?? [];
-    list.push(ratio);
-    byCategory.set(key, list);
+    const residuals = byCategory.get(key) ?? [];
+    residuals.push(residual);
+    byCategory.set(key, residuals);
   }
-  all.sort((a, b) => a - b);
-  const globalRaw = median(all);
-  const global = Number.isFinite(globalRaw)
-    ? Math.min(model.multiple_cap, Math.max(model.multiple_floor, globalRaw))
-    : 0.25;
-  const table: CompsTable = { by_category: {}, counts: {}, global, global_count: all.length };
-  for (const [key, list] of [...byCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
-    list.sort((a, b) => a - b);
-    const raw = median(list);
-    const shrunk = (list.length * raw + model.shrink_prior * global) / (list.length + model.shrink_prior);
-    table.by_category[key] = Math.min(model.multiple_cap, Math.max(model.multiple_floor, shrunk));
-    table.counts[key] = list.length;
+  const offsets: Record<string, number> = {};
+  const counts: Record<string, number> = {};
+  for (const [key, residuals] of [...byCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    residuals.sort((a, b) => a - b);
+    offsets[key] = (residuals.length * median(residuals)) / (residuals.length + model.shrink_prior);
+    counts[key] = residuals.length;
   }
-  return table;
-}
-
-/** The multiple a protocol's category calibrates to, or the global fallback. */
-export function multipleFor(p: SnapshotProtocol, comps: CompsTable): { multiple: number; count: number } {
-  const key = p.category ?? '(uncategorised)';
-  const own = comps.by_category[key];
-  if (own !== undefined) return { multiple: own, count: comps.counts[key] ?? 0 };
-  return { multiple: comps.global, count: comps.global_count };
+  return { intercept, slope, offsets, counts, fit_count: n };
 }
 
 /** The q-th quantile of a sorted list, linearly interpolated. */
@@ -373,28 +385,39 @@ function quantile(sorted: number[], q: number): number {
  * netted verdict prices from: a farm plan should pay at the band's low
  * end, not at its middle.
  */
-export function calibrateBands(snapshot: Snapshot, model: ModelConstants = MODEL): BandTable {
+/**
+ * The residual band: for each category, the 25th and 75th percentiles of
+ * its traded protocols' residuals from the fitted line (after offsets),
+ * in log points, shrunk toward the global percentiles by a prior of
+ * `shrink_prior` phantom protocols. The verdict prices a protocol at the
+ * low end of its band — the fitted value times exp(low) — so the
+ * conservative case always sits below the fitted value.
+ */
+export function calibrateBands(
+  snapshot: Snapshot,
+  fit: RegressionFit,
+  model: ModelConstants = MODEL,
+): BandTable {
   const byCategory = new Map<string, number[]>();
   const all: number[] = [];
-  const RATIO_WINSOR = 3;
   for (const p of compProtocols(snapshot)) {
-    const ratio = Math.min(RATIO_WINSOR, Math.max(model.multiple_floor, p.mcap_usd / p.tvl_usd));
-    if (!Number.isFinite(ratio) || ratio <= 0) continue;
-    all.push(ratio);
     const key = p.category ?? '(uncategorised)';
+    const residual =
+      Math.log(p.mcap_usd) - (fit.intercept + fit.slope * Math.log(Math.max(p.tvl_usd, 1)) + (fit.offsets[key] ?? 0));
+    if (!Number.isFinite(residual)) continue;
+    all.push(residual);
     const list = byCategory.get(key) ?? [];
-    list.push(ratio);
+    list.push(residual);
     byCategory.set(key, list);
   }
   all.sort((a, b) => a - b);
   const g25 = quantile(all, 0.25);
   const g75 = quantile(all, 0.75);
-  const clamp = (n: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, n));
   const table: BandTable = {
     by_category: {},
     global: {
-      low: Number.isFinite(g25) ? clamp(g25) : model.multiple_floor,
-      high: Number.isFinite(g75) ? clamp(g75) : 0.25,
+      low: Number.isFinite(g25) ? Math.min(g25, 0) : 0,
+      high: Number.isFinite(g75) ? g75 : 0,
     },
     global_count: all.length,
   };
@@ -402,15 +425,17 @@ export function calibrateBands(snapshot: Snapshot, model: ModelConstants = MODEL
     list.sort((a, b) => a - b);
     const low = (list.length * quantile(list, 0.25) + model.shrink_prior * g25) / (list.length + model.shrink_prior);
     const high = (list.length * quantile(list, 0.75) + model.shrink_prior * g75) / (list.length + model.shrink_prior);
-    table.by_category[key] = { low: clamp(low), high: clamp(high), n: list.length };
+    // The low end never sits above the fitted value: a band whose 25th
+    // percentile is positive prices at the fitted value itself.
+    table.by_category[key] = { low: Math.min(low, 0), high, n: list.length };
   }
   return table;
 }
 
 /**
  * The blind holdout, run both ways: the traded protocols, sorted by slug,
- * split into alternating halves; the multiples are fitted on one half
- * only and the other half's market caps are predicted with the same
+ * split into alternating halves; the line is fitted on one half only
+ * and the other half's market caps are predicted with the same
  * impliedValue() the board uses — then the halves swap. Nothing in a
  * test half touches its calibration, and every traded protocol is
  * predicted exactly once, so the pooled miss is the model's honest miss
@@ -422,7 +447,7 @@ export function validateOutOfSample(snapshot: Snapshot, model: ModelConstants = 
     fit: (SnapshotProtocol & { mcap_usd: number })[],
     test: (SnapshotProtocol & { mcap_usd: number })[],
   ): ValidationSplit => {
-    const fitComps = calibrateComps({ ...snapshot, protocols: fit }, model);
+    const fitComps = fitRegression(fit, model);
     const predictions: ValidationPrediction[] = test.map((p) => {
       const predicted = impliedValue(p, snapshot.as_of, fitComps, model).implied;
       const actual = p.mcap_usd;
@@ -469,15 +494,20 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-/** The multipliers and the implied value one protocol gets. */
+/** The fitted value, the multipliers and the implied value one protocol gets. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
-  comps: CompsTable,
+  fit: RegressionFit,
   model: ModelConstants = MODEL,
-): { implied: number; multiple: number; compsCount: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
+): { implied: number; fitted: number; multiple: number; offset: number; compsCount: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
-  const { multiple, count } = multipleFor(protocol, comps);
+  const key = protocol.category ?? '(uncategorised)';
+  const offset = fit.offsets[key] ?? 0;
+  const count = fit.counts[key] ?? 0;
+  const tvl = Math.max(protocol.tvl_usd, 1);
+  const fitted = Math.exp(fit.intercept + fit.slope * Math.log(tvl) + offset);
+  const multiple = fitted / tvl;
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
@@ -487,8 +517,8 @@ export function impliedValue(
     (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const extraChains = Math.min(Math.max(protocol.chains.length - 1, 0), model.chain_max_steps);
   const chainMult = 1 + extraChains * model.chain_step;
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * chainMult));
-  return { implied, multiple, compsCount: count, growthPct, growthMult, maturityMult, chainMult, age };
+  const implied = Math.max(1, Math.round(fitted * growthMult * maturityMult * chainMult));
+  return { implied, fitted, multiple, offset, compsCount: count, growthPct, growthMult, maturityMult, chainMult, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -531,8 +561,8 @@ export function isRankable(p: SnapshotProtocol): boolean {
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const comps = calibrateComps(snapshot, model);
-  const bands = calibrateBands(snapshot, model);
+  const fit = fitRegression(compProtocols(snapshot), model);
+  const bands = calibrateBands(snapshot, fit, model);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug it names is ranked.
@@ -546,7 +576,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     if (!chosen.has(p.slug) && isRankable(p)) chosen.set(p.slug, p);
   }
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, comps, model);
+    const v = impliedValue(p, snapshot.as_of, fit, model);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -566,7 +596,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      category_multiple: round4(s.multiple),
+      fitted_multiple: round4(s.multiple),
+      fitted_value_usd: Math.round(s.fitted),
       comps_count: s.compsCount,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
@@ -622,22 +653,23 @@ export function gasUsd(chain: string): number {
 }
 
 /**
- * The netted verdict: the protocol at the LOW end of its comps band, a
- * stated share of a stated community allocation split among a stated
- * number of farmers, against the farm plan's own gas and fees. FARM when
- * the expected take clears the cost tenfold, THIN when it clears it
- * twofold, SKIP otherwise. The assumptions are the model's constants,
- * stated on the page next to every verdict.
+ * The netted verdict: the protocol at the LOW end of its residual band —
+ * the fitted value times the band's low end — a stated share of a stated
+ * community allocation split among a stated number of farmers, against
+ * the farm plan's own gas and fees. FARM when the expected take clears
+ * the cost tenfold, THIN when it clears it twofold, SKIP otherwise. The
+ * assumptions are the model's constants, stated on the page next to
+ * every verdict.
  */
 export function verdictFor(
   p: SnapshotProtocol,
-  mults: { growthMult: number; maturityMult: number; chainMult: number },
+  v: { fitted: number; growthMult: number; maturityMult: number; chainMult: number },
   bands: BandTable,
   model: ModelConstants = MODEL,
 ): Verdict {
   const key = p.category ?? '(uncategorised)';
   const band = bands.by_category[key] ?? bands.global;
-  const bandLow = Math.max(1, Math.round(p.tvl_usd * band.low * mults.growthMult * mults.maturityMult * mults.chainMult));
+  const bandLow = Math.max(1, Math.round(v.fitted * Math.exp(band.low) * v.growthMult * v.maturityMult * v.chainMult));
   const prizeLow = (bandLow * model.farm_share) / model.farmers;
   const costUsd = gasUsd(chainOf(p)) * model.plan_txs + model.flat_cost_usd;
   const ratio = prizeLow / costUsd;
@@ -786,7 +818,8 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
-    category_multiple: row.model.category_multiple,
+    fitted_multiple: row.model.fitted_multiple,
+    fitted_value_usd: row.model.fitted_value_usd,
     comps_count: row.model.comps_count,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
@@ -796,7 +829,7 @@ export function radarRow(row: BoardRow): RadarRow {
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const comps = calibrateComps(snapshot, model);
+  const regression = fitRegression(compProtocols(snapshot), model);
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
@@ -806,7 +839,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
-    comps,
+    regression,
     comp_protocols: compProtocols(snapshot).map((p) => ({
       slug: p.slug,
       name: p.name,
@@ -817,7 +850,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       mcap_usd: p.mcap_usd,
       listed_at: p.listed_at,
     })),
-    bands: calibrateBands(snapshot, model),
+    bands: calibrateBands(snapshot, regression, model),
     validation: validateOutOfSample(snapshot, model),
     watchlist: snapshot.watchlist,
     watchlist_size: snapshot.watchlist.length,
