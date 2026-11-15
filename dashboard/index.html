@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Radar: pre-token protocols ranked by implied value</title>
+<meta name="description" content="A radar for protocols that record no token yet, ranked by an implied value calibrated from the traded market, with a farm plan for each.">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to the board</a>
+<header class="top">
+  <div class="wrap">
+    <div class="brand">
+      <span class="dot" aria-hidden="true"></span>
+      <div>
+        <h1>Token Radar</h1>
+        <p class="tag">Pre-token protocols, ranked by implied value, with a farm plan each.</p>
+      </div>
+    </div>
+    <nav class="tabs" aria-label="Views">
+      <button type="button" data-view="board" aria-current="page">Board</button>
+      <button type="button" data-view="live">Live tokens</button>
+      <button type="button" data-view="model">Model</button>
+    </nav>
+  </div>
+</header>
+<main id="main" class="wrap" tabindex="-1">
+  <section class="stats" id="stats" aria-label="Snapshot summary"></section>
+  <section class="panel" id="controls" aria-label="Board controls"></section>
+  <section id="view" aria-live="polite"></section>
+  <footer class="foot">
+    <p>Implied values are this radar's own claim from the snapshot's figures, never a prediction that a token is issued or what it will trade at. A protocol is described as recording no token: its record may still miss one. Snapshot <span id="asof"></span>, source: DefiLlama public API, fetched once and sealed.</p>
+  </footer>
+</main>
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
