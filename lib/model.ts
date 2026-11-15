@@ -17,10 +17,12 @@
 //      discounted for the risk that the record is new.
 //   4. Reach: a protocol live on more chains gets a small premium, capped.
 //
-// The model is tested blind before it is trusted: the traded protocols are
-// split in two by slug order, the multiples are fitted on one half only,
-// and the other half's market caps are predicted without ever touching
-// calibration. validateOutOfSample() reports the miss. Every farm plan
+// The model is tested blind before it is trusted, twice: the traded
+// protocols are split in two by slug order, the multiples are fitted on
+// one half only and the other half's market caps are predicted without
+// ever touching calibration — then the halves swap, so every traded
+// protocol is predicted exactly once by a fit that never saw it.
+// validateOutOfSample() reports both splits and the pooled miss. Every farm plan
 // ends in a netted verdict: the low end of the comps band, a stated share
 // of a stated community allocation, against the plan's own gas and fees.
 // FARM, THIN or SKIP, with the arithmetic on the page.
@@ -104,7 +106,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label, shown in the dashboard. */
-export const MODEL_VERSION = 'radar-comps-2';
+export const MODEL_VERSION = 'radar-comps-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -218,14 +220,26 @@ export interface ValidationPrediction {
   abs_error: number;
 }
 
-/** The blind holdout's result: how far the fitted model misses unseen market caps. */
-export interface ValidationResult {
+/** One direction of the blind holdout: fitted on one half, tested on the other. */
+export interface ValidationSplit {
   fit_count: number;
   test_count: number;
   median_abs_error: number;
   within_2x: number;
   within_3x: number;
   predictions: ValidationPrediction[];
+}
+
+/** The blind holdout's result: both directions, plus every protocol predicted once. */
+export interface ValidationResult {
+  splits: ValidationSplit[];
+  pooled: {
+    count: number;
+    median_abs_error: number;
+    within_2x: number;
+    within_3x: number;
+    predictions: ValidationPrediction[];
+  };
 }
 
 /** A farm plan's netted verdict: FARM with conviction, THIN with a small position, or SKIP. */
@@ -394,32 +408,55 @@ export function calibrateBands(snapshot: Snapshot, model: ModelConstants = MODEL
 }
 
 /**
- * The blind holdout: the traded protocols, sorted by slug, split into
- * alternating halves; the multiples are fitted on the even half only and
- * the odd half's market caps are predicted with the same impliedValue()
- * the board uses. Nothing in the test half touches calibration, so the
- * miss is the model's honest miss on unseen protocols.
+ * The blind holdout, run both ways: the traded protocols, sorted by slug,
+ * split into alternating halves; the multiples are fitted on one half
+ * only and the other half's market caps are predicted with the same
+ * impliedValue() the board uses — then the halves swap. Nothing in a
+ * test half touches its calibration, and every traded protocol is
+ * predicted exactly once, so the pooled miss is the model's honest miss
+ * on unseen protocols and neither direction can hide behind a lucky split.
  */
 export function validateOutOfSample(snapshot: Snapshot, model: ModelConstants = MODEL): ValidationResult {
   const sorted = compProtocols(snapshot).sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
-  const fit = sorted.filter((_, i) => i % 2 === 0);
-  const test = sorted.filter((_, i) => i % 2 === 1);
-  const fitComps = calibrateComps({ ...snapshot, protocols: fit }, model);
-  const predictions: ValidationPrediction[] = test.map((p) => {
-    const predicted = impliedValue(p, snapshot.as_of, fitComps, model).implied;
-    const actual = p.mcap_usd;
-    return { slug: p.slug, name: p.name, actual, predicted, abs_error: Math.abs(predicted - actual) / actual };
-  });
-  predictions.sort((a, b) => a.abs_error - b.abs_error || (a.slug < b.slug ? -1 : 1));
-  const errors = predictions.map((p) => p.abs_error).sort((a, b) => a - b);
-  const n = errors.length;
+  const runSplit = (
+    fit: (SnapshotProtocol & { mcap_usd: number })[],
+    test: (SnapshotProtocol & { mcap_usd: number })[],
+  ): ValidationSplit => {
+    const fitComps = calibrateComps({ ...snapshot, protocols: fit }, model);
+    const predictions: ValidationPrediction[] = test.map((p) => {
+      const predicted = impliedValue(p, snapshot.as_of, fitComps, model).implied;
+      const actual = p.mcap_usd;
+      return { slug: p.slug, name: p.name, actual, predicted, abs_error: Math.abs(predicted - actual) / actual };
+    });
+    predictions.sort((a, b) => a.abs_error - b.abs_error || (a.slug < b.slug ? -1 : 1));
+    const errors = predictions.map((p) => p.abs_error).sort((a, b) => a - b);
+    const n = errors.length;
+    return {
+      fit_count: fit.length,
+      test_count: test.length,
+      median_abs_error: n === 0 ? NaN : median(errors),
+      within_2x: n === 0 ? 0 : errors.filter((e) => e <= 1).length / n,
+      within_3x: n === 0 ? 0 : errors.filter((e) => e <= 2).length / n,
+      predictions,
+    };
+  };
+  const even = sorted.filter((_, i) => i % 2 === 0);
+  const odd = sorted.filter((_, i) => i % 2 === 1);
+  const splits = [runSplit(even, odd), runSplit(odd, even)];
+  const pooledPredictions = [...splits[0].predictions, ...splits[1].predictions].sort(
+    (a, b) => a.abs_error - b.abs_error || (a.slug < b.slug ? -1 : 1),
+  );
+  const pooledErrors = pooledPredictions.map((p) => p.abs_error).sort((a, b) => a - b);
+  const n = pooledErrors.length;
   return {
-    fit_count: fit.length,
-    test_count: test.length,
-    median_abs_error: n === 0 ? NaN : median(errors),
-    within_2x: n === 0 ? 0 : errors.filter((e) => e <= 1).length / n,
-    within_3x: n === 0 ? 0 : errors.filter((e) => e <= 2).length / n,
-    predictions,
+    splits,
+    pooled: {
+      count: n,
+      median_abs_error: n === 0 ? NaN : median(pooledErrors),
+      within_2x: n === 0 ? 0 : pooledErrors.filter((e) => e <= 1).length / n,
+      within_3x: n === 0 ? 0 : pooledErrors.filter((e) => e <= 2).length / n,
+      predictions: pooledPredictions,
+    },
   };
 }
 

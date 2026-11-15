@@ -13,10 +13,12 @@
  * protocols in that category, shrunk toward the global median when the
  * category has few traded peers. See the Model view for the full table.
  *
- * The model is tested blind in validateOutOfSample(): multiples fitted on
- * half the traded protocols, the other half predicted unseen. Every farm
- * plan ends in a netted verdict from verdictFor(): the low end of the
- * comps band against the plan's own gas and fees, FARM, THIN or SKIP.
+ * The model is tested blind in validateOutOfSample(), twice: multiples
+ * fitted on half the traded protocols, the other half predicted unseen,
+ * then the halves swap, so every traded protocol is predicted exactly
+ * once by a fit that never saw it. Every farm plan ends in a netted
+ * verdict from verdictFor(): the low end of the comps band against the
+ * plan's own gas and fees, FARM, THIN or SKIP.
  */
 (function () {
   'use strict';
@@ -143,26 +145,36 @@
     return table;
   }
 
-  /* The blind holdout: traded protocols sorted by slug, split into
-     alternating halves; multiples fitted on the even half only, the odd
-     half's market caps predicted with impliedValue(). Mirrors
-     validateOutOfSample() in lib/model.ts. */
+  /* The blind holdout, run both ways: traded protocols sorted by slug,
+     split into alternating halves; multiples fitted on one half only,
+     the other half's market caps predicted with impliedValue() — then
+     the halves swap, so every traded protocol is predicted exactly once.
+     Mirrors validateOutOfSample() in lib/model.ts. */
   function validateOutOfSample(comps, asOf, model) {
     var sorted = comps.slice().sort(function (a, b) { return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0; });
-    var fit = [], test = [], i;
-    for (i = 0; i < sorted.length; i++) { if (i % 2 === 0) fit.push(sorted[i]); else test.push(sorted[i]); }
-    var fitComps = calibrateCompsFrom(fit, model);
-    var predictions = test.map(function (p) {
-      var predicted = impliedValue(p, asOf, fitComps, model).implied;
-      return { slug: p.slug, name: p.name, actual: p.mcap_usd, predicted: predicted, abs_error: Math.abs(predicted - p.mcap_usd) / p.mcap_usd };
-    });
-    predictions.sort(function (a, b) { return a.abs_error - b.abs_error || (a.slug < b.slug ? -1 : 1); });
-    var errors = predictions.map(function (p) { return p.abs_error; }).sort(function (a, b) { return a - b; });
-    var n = errors.length;
-    var within2 = 0, within3 = 0;
-    for (i = 0; i < n; i++) { if (errors[i] <= 1) within2++; if (errors[i] <= 2) within3++; }
-    return { fit_count: fit.length, test_count: test.length, median_abs_error: n === 0 ? NaN : median(errors),
-      within_2x: n === 0 ? 0 : within2 / n, within_3x: n === 0 ? 0 : within3 / n, predictions: predictions };
+    function runSplit(fit, test) {
+      var fitComps = calibrateCompsFrom(fit, model);
+      var predictions = test.map(function (p) {
+        var predicted = impliedValue(p, asOf, fitComps, model).implied;
+        return { slug: p.slug, name: p.name, actual: p.mcap_usd, predicted: predicted, abs_error: Math.abs(predicted - p.mcap_usd) / p.mcap_usd };
+      });
+      predictions.sort(function (a, b) { return a.abs_error - b.abs_error || (a.slug < b.slug ? -1 : 1); });
+      var errors = predictions.map(function (p) { return p.abs_error; }).sort(function (a, b) { return a - b; });
+      var n = errors.length, within2 = 0, within3 = 0, i;
+      for (i = 0; i < n; i++) { if (errors[i] <= 1) within2++; if (errors[i] <= 2) within3++; }
+      return { fit_count: fit.length, test_count: test.length, median_abs_error: n === 0 ? NaN : median(errors),
+        within_2x: n === 0 ? 0 : within2 / n, within_3x: n === 0 ? 0 : within3 / n, predictions: predictions };
+    }
+    var even = [], odd = [], i;
+    for (i = 0; i < sorted.length; i++) { if (i % 2 === 0) even.push(sorted[i]); else odd.push(sorted[i]); }
+    var splits = [runSplit(even, odd), runSplit(odd, even)];
+    var pooledPredictions = splits[0].predictions.concat(splits[1].predictions).sort(
+      function (a, b) { return a.abs_error - b.abs_error || (a.slug < b.slug ? -1 : 1); });
+    var pooledErrors = pooledPredictions.map(function (p) { return p.abs_error; }).sort(function (a, b) { return a - b; });
+    var n = pooledErrors.length, within2 = 0, within3 = 0;
+    for (i = 0; i < n; i++) { if (pooledErrors[i] <= 1) within2++; if (pooledErrors[i] <= 2) within3++; }
+    return { splits: splits, pooled: { count: n, median_abs_error: n === 0 ? NaN : median(pooledErrors),
+      within_2x: n === 0 ? 0 : within2 / n, within_3x: n === 0 ? 0 : within3 / n, predictions: pooledPredictions } };
   }
 
   /* ---------- the farm plan (mirrors lib/model.ts: same steps, same costs) ---------- */
@@ -346,12 +358,14 @@
      the screenshots show is what this source computes. */
   var bands = bandTable(R.comp_protocols, R.model);
   var validation = validateOutOfSample(R.comp_protocols, R.as_of, R.model);
-  var farmCount = 0;
+  var farmCount = 0, thinCount = 0, skipCount = 0;
   rows.forEach(function (r) {
     var v = impliedValue(r, R.as_of, R.comps, R.model);
     r.verdict = verdictFor(r, v, bands, R.model);
     r.verdict_rank = r.verdict.verdict === 'FARM' ? 0 : r.verdict.verdict === 'THIN' ? 1 : 2;
     if (r.verdict.verdict === 'FARM') farmCount++;
+    else if (r.verdict.verdict === 'THIN') thinCount++;
+    else skipCount++;
   });
 
   var state = {
@@ -360,6 +374,7 @@
     query: '',
     category: '',
     chain: '',
+    verdict: '',
     watchOnly: false,
     minTvl: 0,
     sortKey: 'rank',
@@ -376,6 +391,7 @@
       if (q && (r.name.toLowerCase().indexOf(q) === -1 && r.slug.indexOf(q) === -1 && String(r.category || '').toLowerCase().indexOf(q) === -1)) return false;
       if (state.category && r.category !== state.category) return false;
       if (state.chain && r.chains.indexOf(state.chain) === -1) return false;
+      if (state.verdict && r.verdict.verdict !== state.verdict) return false;
       if (state.watchOnly && !isWatchlisted(r)) return false;
       if (r.tvl_usd < state.minTvl) return false;
       return true;
@@ -438,12 +454,18 @@
       '<option value="100000000"' + (state.minTvl === 100000000 ? ' selected' : '') + '>$100M+</option>' +
       '<option value="500000000"' + (state.minTvl === 500000000 ? ' selected' : '') + '>$500M+</option>' +
       '<option value="1000000000"' + (state.minTvl === 1000000000 ? ' selected' : '') + '>$1B+</option></select></label>' +
+      '<label class="field">Verdict<select id="f-verdict">' +
+      '<option value=""' + (state.verdict === '' ? ' selected' : '') + '>All verdicts</option>' +
+      '<option value="FARM"' + (state.verdict === 'FARM' ? ' selected' : '') + '>FARM (' + farmCount + ')</option>' +
+      '<option value="THIN"' + (state.verdict === 'THIN' ? ' selected' : '') + '>THIN (' + thinCount + ')</option>' +
+      '<option value="SKIP"' + (state.verdict === 'SKIP' ? ' selected' : '') + '>SKIP (' + skipCount + ')</option></select></label>' +
       '<label class="field check"><input id="f-watch" type="checkbox"' + (state.watchOnly ? ' checked' : '') + '> Watchlist only</label>' +
       '<span class="count" id="f-count"></span>';
     document.getElementById('f-q').addEventListener('input', function (e) { state.query = e.target.value; renderView(); });
     document.getElementById('f-cat').addEventListener('change', function (e) { state.category = e.target.value; renderView(); });
     document.getElementById('f-chain').addEventListener('change', function (e) { state.chain = e.target.value; renderView(); });
     document.getElementById('f-tvl').addEventListener('change', function (e) { state.minTvl = Number(e.target.value); renderView(); });
+    document.getElementById('f-verdict').addEventListener('change', function (e) { state.verdict = e.target.value; renderView(); });
     document.getElementById('f-watch').addEventListener('change', function (e) { state.watchOnly = e.target.checked; renderView(); });
   }
 
@@ -536,8 +558,9 @@
   }
 
   function validationHtml() {
-    var best = validation.predictions.slice(0, 5);
-    var worst = validation.predictions.slice(-5).reverse();
+    var pooled = validation.pooled;
+    var best = pooled.predictions.slice(0, 5);
+    var worst = pooled.predictions.slice(-5).reverse();
     function predRows(list) {
       return list.map(function (p) {
         return '<tr><td><span class="name">' + esc(p.name) + '</span><div class="sub">' + esc(p.slug) + '</div></td>' +
@@ -545,16 +568,24 @@
           '<td class="num">' + pctPlain(p.abs_error * 100) + '</td></tr>';
       }).join('');
     }
+    var splitRows = validation.splits.map(function (s, i) {
+      return '<tr><td>' + (i === 0 ? 'A: fitted on even slugs' : 'B: fitted on odd slugs') + '</td>' +
+        '<td class="num">' + s.fit_count + '</td><td class="num">' + s.test_count + '</td>' +
+        '<td class="num">' + pctPlain(s.median_abs_error * 100) + '</td>' +
+        '<td class="num">' + pctPlain(s.within_2x * 100) + '</td>' +
+        '<td class="num">' + pctPlain(s.within_3x * 100) + '</td></tr>';
+    }).join('');
     return '<article class="detail"><h2>Validation: tested blind</h2>' +
-      '<p class="meta">The multiples are fitted on one half of the traded protocols and tested on the other half, which calibration never sees. The split is every second protocol in slug order, so anyone can reproduce it.</p>' +
+      '<p class="meta">The multiples are fitted on one half of the traded protocols and tested on the other half, which calibration never sees — then the halves swap, so every traded protocol is predicted exactly once by a fit that never saw it. The split is every second protocol in slug order, so anyone can reproduce it.</p>' +
       '<div class="grid">' +
-      '<div class="cell"><span>Fitted on</span><b>' + validation.fit_count + ' traded protocols</b></div>' +
-      '<div class="cell"><span>Tested on</span><b>' + validation.test_count + ' unseen protocols</b></div>' +
-      '<div class="cell"><span>Median miss</span><b>' + pctPlain(validation.median_abs_error * 100) + '</b></div>' +
-      '<div class="cell"><span>Within 2× of the market cap</span><b>' + pctPlain(validation.within_2x * 100) + '</b></div>' +
-      '<div class="cell"><span>Within 3×</span><b>' + pctPlain(validation.within_3x * 100) + '</b></div>' +
+      '<div class="cell"><span>Predicted blind</span><b>' + pooled.count + ' traded protocols</b></div>' +
+      '<div class="cell"><span>Median miss</span><b>' + pctPlain(pooled.median_abs_error * 100) + '</b></div>' +
+      '<div class="cell"><span>Within 2× of the market cap</span><b>' + pctPlain(pooled.within_2x * 100) + '</b></div>' +
+      '<div class="cell"><span>Within 3×</span><b>' + pctPlain(pooled.within_3x * 100) + '</b></div>' +
       '</div>' +
-      '<p class="sub">A comps multiple is a rough instrument: the median unseen protocol is missed by about ' + pctPlain(validation.median_abs_error * 100) + '. The board ranks by the same fitted multiples, so read the ranks as bands, not prices. The holdout is validateOutOfSample() in this page\'s source.</p>' +
+      '<h3>Both directions</h3>' +
+      '<table><thead><tr><th>Split</th><th class="num">Fitted on</th><th class="num">Tested on</th><th class="num">Median miss</th><th class="num">Within 2×</th><th class="num">Within 3×</th></tr></thead><tbody>' + splitRows + '</tbody></table>' +
+      '<p class="sub">A comps multiple is a rough instrument: the median unseen protocol is missed by about ' + pctPlain(pooled.median_abs_error * 100) + '. The board ranks by the same fitted multiples, so read the ranks as bands, not prices. The holdout is validateOutOfSample() in this page\'s source.</p>' +
       '<h3>Closest predictions</h3>' +
       '<table><thead><tr><th>Protocol</th><th class="num">Market cap</th><th class="num">Predicted</th><th class="num">Miss</th></tr></thead><tbody>' + predRows(best) + '</tbody></table>' +
       '<h3>Furthest predictions</h3>' +
@@ -587,7 +618,7 @@
       '<p>Wrapped, staked and bridged products of tokens that already trade are kept out of the early set and out of the comps by the house\'s own watchlist rule: ' +
       'bridge, liquid staking and restaking categories, wrapped/staked names, version markers and exchange names. Every watchlist slug is always ranked.</p>' +
       '<h3>Tested blind</h3>' +
-      '<p>The multiples are fitted on half the traded protocols and tested on the other half, which calibration never sees. Median miss ' + pctPlain(validation.median_abs_error * 100) + ', ' + pctPlain(validation.within_2x * 100) + ' within 2× of the market cap. See the Validation view for the method and every prediction.</p>' +
+      '<p>The multiples are fitted twice: once on each half of the traded protocols, each half tested by a fit that never saw it, so all ' + validation.pooled.count + ' traded protocols are predicted blind. Median miss ' + pctPlain(validation.pooled.median_abs_error * 100) + ', ' + pctPlain(validation.pooled.within_2x * 100) + ' within 2× of the market cap. See the Validation view for the method and every prediction.</p>' +
       '<h3>Comps table</h3>' +
       '<table><thead><tr><th>Category</th><th class="num">Multiple</th><th class="num">Traded peers</th></tr></thead><tbody>' +
       compRows + '<tr><td><b>Global fallback</b></td><td class="num"><b>' + mult4(R.comps.global) + '×</b></td><td class="num"><b>' + R.comps.global_count + '</b></td></tr>' +
