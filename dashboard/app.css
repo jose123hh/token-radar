@@ -66,6 +66,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .name { font-weight: 600; }
 .sub { color: var(--faint); font-size: 0.82rem; }
 .badge { display: inline-block; font-size: 0.72rem; font-weight: 650; color: var(--acc2); border: 1px solid #4a3d18; background: #241d0c; border-radius: 999px; padding: 1px 8px; margin-left: 6px; white-space: nowrap; }
+.verdict { display: inline-block; font-size: 0.72rem; font-weight: 650; border-radius: 999px; padding: 1px 8px; margin-left: 6px; white-space: nowrap; }
+.verdict.farm { color: #06131c; background: var(--acc); }
+.verdict.thin { color: var(--acc2); border: 1px solid #4a3d18; background: #241d0c; }
+.verdict.skip { color: var(--dim); border: 1px solid var(--line); background: var(--panel2); }
+h2 .verdict { vertical-align: 2px; }
 .up { color: var(--up); }
 .down { color: var(--down); }
 .flat { color: var(--dim); }

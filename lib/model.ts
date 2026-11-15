@@ -4,20 +4,32 @@
 // from the snapshot's OWN market data, not from a hand-kept list of names:
 //
 //   1. Comps: for every category, the median market-cap/TVL ratio of the
-//      protocols in that category whose token already trades. A pre-token
-//      protocol is worth what its traded peers are worth per dollar of TVL.
-//      Categories with few traded peers are shrunk toward the global median,
-//      so one outlier cannot set a price; categories with none use it.
+//      protocols in that category whose token already trades AND that are
+//      not themselves wrapped, staked or bridged products: a wrapped
+//      product's ratio is the token it wraps, not a peer multiple. A
+//      pre-token protocol is worth what its traded peers are worth per
+//      dollar of TVL. Categories with few traded peers are shrunk toward
+//      the global median, so one outlier cannot set a price; categories
+//      with none use it.
 //   2. Growth: the 7-day TVL change, clamped, moves the value up or down.
 //   3. Maturity: the longer a protocol has run with no token, the closer its
 //      implied value sits to the full comps value; young protocols are
 //      discounted for the risk that the record is new.
 //   4. Reach: a protocol live on more chains gets a small premium, capped.
 //
+// The model is tested blind before it is trusted: the traded protocols are
+// split in two by slug order, the multiples are fitted on one half only,
+// and the other half's market caps are predicted without ever touching
+// calibration. validateOutOfSample() reports the miss. Every farm plan
+// ends in a netted verdict: the low end of the comps band, a stated share
+// of a stated community allocation, against the plan's own gas and fees.
+// FARM, THIN or SKIP, with the arithmetic on the page.
+//
 // Wrapped, staked and bridged products of tokens that already trade are
-// never ranked as early finds: the house's own watchlist rule (its excluded
-// categories, wrapped/staked names, version markers and exchange names)
-// keeps them out of the early set, while every watchlist slug is ranked.
+// never ranked as early finds and never calibrate a multiple: the house's
+// own watchlist rule (its excluded categories, wrapped/staked names,
+// version markers and exchange names) keeps them out of the early set and
+// out of the comps, while every watchlist slug is ranked.
 //
 //   implied = TVL x categoryMultiple x growthMult x maturityMult x chainMult
 //
@@ -62,6 +74,12 @@ export interface ModelConstants {
   shrink_prior: number;
   chain_step: number;
   chain_max_steps: number;
+  farm_share: number;
+  farmers: number;
+  plan_txs: number;
+  flat_cost_usd: number;
+  farm_ratio: number;
+  thin_ratio: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -77,10 +95,16 @@ export const MODEL: ModelConstants = {
   shrink_prior: 3,
   chain_step: 0.04,
   chain_max_steps: 5,
+  farm_share: 0.05,
+  farmers: 1000,
+  plan_txs: 6,
+  flat_cost_usd: 5,
+  farm_ratio: 10,
+  thin_ratio: 2,
 };
 
 /** The model's version label, shown in the dashboard. */
-export const MODEL_VERSION = 'radar-comps-1';
+export const MODEL_VERSION = 'radar-comps-2';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -159,6 +183,63 @@ export interface CompsTable {
   global_count: number;
 }
 
+/** A traded protocol as the dashboard receives it: the raw record the comps and the holdout recompute from. */
+export interface CompProtocol {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  change_7d: number | null;
+  mcap_usd: number;
+  listed_at: string | null;
+}
+
+/** One category's comps band: the 25th and 75th percentiles of its traded ratios. */
+export interface BandRow {
+  low: number;
+  high: number;
+  n: number;
+}
+
+/** The comps band: one low/high pair per category, plus the global fallback. */
+export interface BandTable {
+  by_category: Record<string, BandRow>;
+  global: { low: number; high: number };
+  global_count: number;
+}
+
+/** One blind-holdout prediction: the market's value against the model's, on a protocol calibration never saw. */
+export interface ValidationPrediction {
+  slug: string;
+  name: string;
+  actual: number;
+  predicted: number;
+  abs_error: number;
+}
+
+/** The blind holdout's result: how far the fitted model misses unseen market caps. */
+export interface ValidationResult {
+  fit_count: number;
+  test_count: number;
+  median_abs_error: number;
+  within_2x: number;
+  within_3x: number;
+  predictions: ValidationPrediction[];
+}
+
+/** A farm plan's netted verdict: FARM with conviction, THIN with a small position, or SKIP. */
+export type VerdictLabel = 'FARM' | 'THIN' | 'SKIP';
+
+/** The verdict and the arithmetic behind it: the low end of the band, the expected take, the cost, the ratio. */
+export interface Verdict {
+  verdict: VerdictLabel;
+  band_low: number;
+  prize_low: number;
+  cost_usd: number;
+  ratio: number;
+}
+
 /** Everything the dashboard needs. */
 export interface RadarData {
   as_of: string;
@@ -167,6 +248,9 @@ export interface RadarData {
   model: ModelConstants;
   model_version: string;
   comps: CompsTable;
+  comp_protocols: CompProtocol[];
+  bands: BandTable;
+  validation: ValidationResult;
   watchlist: string[];
   watchlist_size: number;
   board_size: number;
@@ -200,6 +284,19 @@ function median(sorted: number[]): number {
 }
 
 /**
+ * The protocols that calibrate the model: traded (a market cap over a
+ * positive TVL) and not wrapped products. A wrapped, staked or bridged
+ * product's market-cap/TVL ratio is the token it wraps, not a peer
+ * multiple, so the house's watchlist rule keeps them out of the comps.
+ */
+export function compProtocols(snapshot: Snapshot): (SnapshotProtocol & { mcap_usd: number })[] {
+  return snapshot.protocols.filter(
+    (p): p is SnapshotProtocol & { mcap_usd: number } =>
+      p.mcap_usd !== null && p.tvl_usd > 0 && p.mcap_usd > 0 && !isWrappedProduct(p),
+  );
+}
+
+/**
  * Calibrate the comps table from the snapshot's traded protocols: for each
  * category, the median market-cap/TVL ratio of its protocols whose token
  * already trades, shrunk toward the global median by a prior of
@@ -213,8 +310,7 @@ export function calibrateComps(snapshot: Snapshot, model: ModelConstants = MODEL
   // One comp's ratio is winsorised before it can move a median: a protocol
   // with a tiny TVL and a large market cap must not set its category's price.
   const RATIO_WINSOR = 3;
-  for (const p of snapshot.protocols) {
-    if (p.mcap_usd === null || p.tvl_usd <= 0 || p.mcap_usd <= 0) continue;
+  for (const p of compProtocols(snapshot)) {
     const ratio = Math.min(RATIO_WINSOR, Math.max(model.multiple_floor, p.mcap_usd / p.tvl_usd));
     if (!Number.isFinite(ratio) || ratio <= 0) continue;
     all.push(ratio);
@@ -245,6 +341,86 @@ export function multipleFor(p: SnapshotProtocol, comps: CompsTable): { multiple:
   const own = comps.by_category[key];
   if (own !== undefined) return { multiple: own, count: comps.counts[key] ?? 0 };
   return { multiple: comps.global, count: comps.global_count };
+}
+
+/** The q-th quantile of a sorted list, linearly interpolated. */
+function quantile(sorted: number[], q: number): number {
+  if (sorted.length === 0) return NaN;
+  const pos = (sorted.length - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (pos - lo);
+}
+
+/**
+ * The comps band: per category, the 25th and 75th percentiles of the traded
+ * protocols' winsorised market-cap/TVL ratios, shrunk toward the global
+ * percentiles with the same prior as the medians. The low end is what the
+ * netted verdict prices from: a farm plan should pay at the band's low
+ * end, not at its middle.
+ */
+export function calibrateBands(snapshot: Snapshot, model: ModelConstants = MODEL): BandTable {
+  const byCategory = new Map<string, number[]>();
+  const all: number[] = [];
+  const RATIO_WINSOR = 3;
+  for (const p of compProtocols(snapshot)) {
+    const ratio = Math.min(RATIO_WINSOR, Math.max(model.multiple_floor, p.mcap_usd / p.tvl_usd));
+    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    all.push(ratio);
+    const key = p.category ?? '(uncategorised)';
+    const list = byCategory.get(key) ?? [];
+    list.push(ratio);
+    byCategory.set(key, list);
+  }
+  all.sort((a, b) => a - b);
+  const g25 = quantile(all, 0.25);
+  const g75 = quantile(all, 0.75);
+  const clamp = (n: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, n));
+  const table: BandTable = {
+    by_category: {},
+    global: {
+      low: Number.isFinite(g25) ? clamp(g25) : model.multiple_floor,
+      high: Number.isFinite(g75) ? clamp(g75) : 0.25,
+    },
+    global_count: all.length,
+  };
+  for (const [key, list] of [...byCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    list.sort((a, b) => a - b);
+    const low = (list.length * quantile(list, 0.25) + model.shrink_prior * g25) / (list.length + model.shrink_prior);
+    const high = (list.length * quantile(list, 0.75) + model.shrink_prior * g75) / (list.length + model.shrink_prior);
+    table.by_category[key] = { low: clamp(low), high: clamp(high), n: list.length };
+  }
+  return table;
+}
+
+/**
+ * The blind holdout: the traded protocols, sorted by slug, split into
+ * alternating halves; the multiples are fitted on the even half only and
+ * the odd half's market caps are predicted with the same impliedValue()
+ * the board uses. Nothing in the test half touches calibration, so the
+ * miss is the model's honest miss on unseen protocols.
+ */
+export function validateOutOfSample(snapshot: Snapshot, model: ModelConstants = MODEL): ValidationResult {
+  const sorted = compProtocols(snapshot).sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const fit = sorted.filter((_, i) => i % 2 === 0);
+  const test = sorted.filter((_, i) => i % 2 === 1);
+  const fitComps = calibrateComps({ ...snapshot, protocols: fit }, model);
+  const predictions: ValidationPrediction[] = test.map((p) => {
+    const predicted = impliedValue(p, snapshot.as_of, fitComps, model).implied;
+    const actual = p.mcap_usd;
+    return { slug: p.slug, name: p.name, actual, predicted, abs_error: Math.abs(predicted - actual) / actual };
+  });
+  predictions.sort((a, b) => a.abs_error - b.abs_error || (a.slug < b.slug ? -1 : 1));
+  const errors = predictions.map((p) => p.abs_error).sort((a, b) => a - b);
+  const n = errors.length;
+  return {
+    fit_count: fit.length,
+    test_count: test.length,
+    median_abs_error: n === 0 ? NaN : median(errors),
+    within_2x: n === 0 ? 0 : errors.filter((e) => e <= 1).length / n,
+    within_3x: n === 0 ? 0 : errors.filter((e) => e <= 2).length / n,
+    predictions,
+  };
 }
 
 /** Whole days from `listedAt` to `asOf`, clamped at zero; null when unknown or bad. */
@@ -319,6 +495,7 @@ export function isRankable(p: SnapshotProtocol): boolean {
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const comps = calibrateComps(snapshot, model);
+  const bands = calibrateBands(snapshot, model);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug it names is ranked.
@@ -360,7 +537,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       chain_multiplier: round4(s.chainMult),
       age_days: s.age,
     },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
+    farm_steps: farmSteps(s.p, s.age, verdictFor(s.p, s, bands, model), model).map(stepText),
   }));
 }
 
@@ -391,6 +568,49 @@ function gasEstimate(chain: string): string {
   if (c.includes('sui') || c.includes('aptos') || c.includes('near') || c.includes('sei')) return 'under $0.10 of gas';
   if (c.includes('bitcoin') || c.includes('lightning')) return 'about $2 of fees';
   return 'about $2 of gas';
+}
+
+/** The same gas table as numbers: the stated ceiling of each estimate, for the netted verdict. */
+export function gasUsd(chain: string): number {
+  const c = chain.toLowerCase();
+  if (c.includes('ethereum')) return 8;
+  if (c.includes('solana')) return 0.1;
+  if (c.includes('arbitrum') || c.includes('optimism') || c.includes('base') || c.includes('zksync') || c.includes('linea') || c.includes('scroll') || c.includes('blast') || c.includes('mode')) return 1;
+  if (c.includes('bsc') || c.includes('bnb')) return 0.5;
+  if (c.includes('polygon')) return 0.2;
+  if (c.includes('avalanche')) return 1;
+  if (c.includes('sui') || c.includes('aptos') || c.includes('near') || c.includes('sei')) return 0.1;
+  if (c.includes('bitcoin') || c.includes('lightning')) return 2;
+  return 2;
+}
+
+/**
+ * The netted verdict: the protocol at the LOW end of its comps band, a
+ * stated share of a stated community allocation split among a stated
+ * number of farmers, against the farm plan's own gas and fees. FARM when
+ * the expected take clears the cost tenfold, THIN when it clears it
+ * twofold, SKIP otherwise. The assumptions are the model's constants,
+ * stated on the page next to every verdict.
+ */
+export function verdictFor(
+  p: SnapshotProtocol,
+  mults: { growthMult: number; maturityMult: number; chainMult: number },
+  bands: BandTable,
+  model: ModelConstants = MODEL,
+): Verdict {
+  const key = p.category ?? '(uncategorised)';
+  const band = bands.by_category[key] ?? bands.global;
+  const bandLow = Math.max(1, Math.round(p.tvl_usd * band.low * mults.growthMult * mults.maturityMult * mults.chainMult));
+  const prizeLow = (bandLow * model.farm_share) / model.farmers;
+  const costUsd = gasUsd(chainOf(p)) * model.plan_txs + model.flat_cost_usd;
+  const ratio = prizeLow / costUsd;
+  return {
+    verdict: ratio >= model.farm_ratio ? 'FARM' : ratio >= model.thin_ratio ? 'THIN' : 'SKIP',
+    band_low: bandLow,
+    prize_low: prizeLow,
+    cost_usd: costUsd,
+    ratio,
+  };
 }
 
 /** How much capital one farm position needs, from the protocol's own TVL. */
@@ -433,12 +653,23 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
+/** $1,234,567: whole dollars with separators, the same in the model and the page. */
+function intUsd(n: number): string {
+  return `$${Math.round(n).toLocaleString('en-US')}`;
+}
+
+/** $12,345.67: separators and two decimals, the same in the model and the page. */
+function money(n: number): string {
+  return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 /**
- * A protocol's farm plan: seven steps, each an action with a cost and a
+ * A protocol's farm plan: eight steps, each an action with a cost and a
  * time, derived from the protocol's own record (category, chains, TVL, age),
- * never from a hand-written list of names.
+ * never from a hand-written list of names. The eighth step is the netted
+ * verdict, with its arithmetic.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+export function farmSteps(p: SnapshotProtocol, age: number | null, verdict: Verdict, model: ModelConstants = MODEL): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
@@ -478,6 +709,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       text: `Write the wallet, the dates and every transaction hash in a farm log, and plan the exit before you need it: note any unstaking delay or withdrawal fee.`,
       cost: 'nothing but the log',
       time: '5 minutes',
+    },
+    {
+      text: `Verdict: ${verdict.verdict} — at the low end of the comps band this protocol is worth ${intUsd(verdict.band_low)}; a ${Math.round(model.farm_share * 100)}% community allocation split among ${model.farmers.toLocaleString('en-US')} farmers pays about ${money(verdict.prize_low)} against about ${money(verdict.cost_usd)} of gas and fees, a ${verdict.ratio.toFixed(1)}x return on cost.`,
+      cost: 'counted in the verdict',
+      time: 'decided before you start',
     },
   ];
 }
@@ -534,6 +770,18 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     model,
     model_version: MODEL_VERSION,
     comps,
+    comp_protocols: compProtocols(snapshot).map((p) => ({
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      chains: p.chains,
+      tvl_usd: p.tvl_usd,
+      change_7d: p.change_7d,
+      mcap_usd: p.mcap_usd,
+      listed_at: p.listed_at,
+    })),
+    bands: calibrateBands(snapshot, model),
+    validation: validateOutOfSample(snapshot, model),
     watchlist: snapshot.watchlist,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
